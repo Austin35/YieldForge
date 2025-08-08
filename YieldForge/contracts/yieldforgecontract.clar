@@ -46,3 +46,113 @@
 (define-map user-last-deposit-block principal uint)
 (define-map cycle-rewards uint uint)
 (define-map stacking-cycles uint {start-block: uint, end-block: uint, amount: uint})
+
+;; public functions
+
+(define-public (deposit (amount uint))
+  (let (
+    (sender tx-sender)
+    (current-balance (get-stx-balance sender))
+    (current-shares (ft-get-balance yield-forge-token sender))
+    (total-supply (ft-get-supply yield-forge-token))
+    (total-stx (var-get total-stx-deposited))
+    (share-amount (if (is-eq total-supply u0)
+                    amount
+                    (/ (* amount total-supply) total-stx)))
+  )
+    ;; Validation checks
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (>= amount MIN_DEPOSIT) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount MAX_DEPOSIT) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount sender (as-contract tx-sender)))
+    
+    ;; Update state
+    (var-set total-stx-deposited (+ total-stx amount))
+    (map-set user-deposits sender (+ (default-to u0 (map-get? user-deposits sender)) amount))
+    (map-set user-last-deposit-block sender block-height)
+    
+    ;; Mint yield tokens
+    (try! (ft-mint? yield-forge-token share-amount sender))
+    
+    ;; Start stacking if not already active
+    (try! (stack-stx-if-needed))
+    
+    (ok {deposited: amount, shares-minted: share-amount})
+  )
+)
+
+(define-public (withdraw (share-amount uint))
+  (let (
+    (sender tx-sender)
+    (user-shares (ft-get-balance yield-forge-token sender))
+    (total-supply (ft-get-supply yield-forge-token))
+    (total-stx (var-get total-stx-deposited))
+    (withdrawal-amount (if (> total-supply u0)
+                         (/ (* share-amount total-stx) total-supply)
+                         u0))
+  )
+    ;; Validation checks
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (> share-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (>= user-shares share-amount) ERR_INSUFFICIENT_SHARES)
+    (asserts! (>= total-stx withdrawal-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Burn yield tokens
+    (try! (ft-burn? yield-forge-token share-amount sender))
+    
+    ;; Update state
+    (var-set total-stx-deposited (- total-stx withdrawal-amount))
+    (map-set user-deposits sender (- (default-to u0 (map-get? user-deposits sender)) withdrawal-amount))
+    
+    ;; Transfer STX to user
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender sender)))
+    
+    (ok {withdrawn: withdrawal-amount, shares-burned: share-amount})
+  )
+)
+
+(define-public (compound-rewards))
+  (let (
+    (current-block block-height)
+    (last-compound (var-get last-compound-block))
+    (btc-rewards (get-pending-btc-rewards))
+  )
+    ;; Only compound if there are rewards and enough time has passed
+    (asserts! (> btc-rewards u0) (ok u0))
+    (asserts! (> current-block (+ last-compound u144)) (ok u0)) ;; ~1 day cooldown
+    
+    ;; Convert BTC to STX via AMM
+    (match (swap-btc-to-stx btc-rewards)
+      stx-amount (begin
+        ;; Update state
+        (var-set total-btc-rewards (+ (var-get total-btc-rewards) btc-rewards))
+        (var-set total-stx-deposited (+ (var-get total-stx-deposited) stx-amount))
+        (var-set last-compound-block current-block)
+        
+        ;; Restake the new STX
+        (try! (stack-stx-if-needed))
+        
+        (ok stx-amount)
+      )
+      (err u0)
+    )
+  )
+)
+
+(define-public (emergency-pause)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (resume-operations)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (var-set contract-paused false)
+    (ok true)
+  )

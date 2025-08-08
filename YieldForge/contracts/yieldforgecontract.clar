@@ -6,8 +6,8 @@
 ;;              Users receive yield tokens representing their share of the growing vault.
 
 ;; traits
-(use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
-(use-trait pox-trait 'ST000000000000000000002AMW42H.pox-4.pox-trait)
+;; (use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+;; (use-trait pox-trait 'ST000000000000000000002AMW42H.pox-4.pox-trait)
 
 ;; token definitions
 (define-fungible-token yield-forge-token u1000000000000000000)
@@ -72,15 +72,15 @@
     ;; Update state
     (var-set total-stx-deposited (+ total-stx amount))
     (map-set user-deposits sender (+ (default-to u0 (map-get? user-deposits sender)) amount))
-    (map-set user-last-deposit-block sender block-height)
+    (map-set user-last-deposit-block sender stacks-block-height)
     
     ;; Mint yield tokens
     (try! (ft-mint? yield-forge-token share-amount sender))
     
     ;; Start stacking if not already active
-    (try! (stack-stx-if-needed))
-    
-    (ok {deposited: amount, shares-minted: share-amount})
+    (let ((stacking-result (stack-stx-if-needed)))
+      (ok {deposited: amount, shares-minted: share-amount})
+    )
   )
 )
 
@@ -114,9 +114,9 @@
   )
 )
 
-(define-public (compound-rewards))
+(define-public (compound-rewards)
   (let (
-    (current-block block-height)
+    (current-block stacks-block-height)
     (last-compound (var-get last-compound-block))
     (btc-rewards (get-pending-btc-rewards))
   )
@@ -126,18 +126,18 @@
     
     ;; Convert BTC to STX via AMM
     (match (swap-btc-to-stx btc-rewards)
-      stx-amount (begin
+      ok-value (begin
         ;; Update state
         (var-set total-btc-rewards (+ (var-get total-btc-rewards) btc-rewards))
-        (var-set total-stx-deposited (+ (var-get total-stx-deposited) stx-amount))
+        (var-set total-stx-deposited (+ (var-get total-stx-deposited) ok-value))
         (var-set last-compound-block current-block)
         
         ;; Restake the new STX
-        (try! (stack-stx-if-needed))
-        
-        (ok stx-amount)
+        (let ((stacking-result (stack-stx-if-needed)))
+          (ok ok-value)
+        )
       )
-      (err u0)
+      err-value (err err-value)
     )
   )
 )
@@ -156,6 +156,7 @@
     (var-set contract-paused false)
     (ok true)
   )
+)
 
 ;; read only functions
 
@@ -220,5 +221,48 @@
 )
 
 (define-read-only (get-current-cycle)
-  (/ block-height CYCLE_LENGTH)
+  (/ stacks-block-height CYCLE_LENGTH)
+)
+
+
+;; private functions
+
+(define-private (stack-stx-if-needed)
+  (let (
+    (total-stx (var-get total-stx-deposited))
+    (current-cycle-num (get-current-cycle))
+  )
+    (if (>= total-stx MIN_DEPOSIT)
+      (begin
+        ;; Update current cycle
+        (var-set current-cycle current-cycle-num)
+        ;; In a real implementation, this would call the actual PoX contract
+        ;; For now, we'll just record the stacking intent
+        (begin
+          (map-set stacking-cycles current-cycle-num 
+            {
+              start-block: stacks-block-height,
+              end-block: (+ stacks-block-height CYCLE_LENGTH),
+              amount: total-stx
+            }
+          )
+          (ok true)
+        )
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-private (swap-btc-to-stx (btc-amount uint))
+  ;; This would interface with an AMM to swap BTC to STX
+  ;; Simplified implementation that estimates STX return
+  (let (
+    (estimated-stx (* btc-amount BTC_TO_USTX_MULTIPLIER))
+  )
+    (if (> btc-amount u0)
+      (ok estimated-stx)
+      (err ERR_SWAP_FAILED)
+    )
+  )
 )

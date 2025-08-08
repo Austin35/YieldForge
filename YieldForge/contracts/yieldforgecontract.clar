@@ -156,3 +156,69 @@
     (var-set contract-paused false)
     (ok true)
   )
+
+;; read only functions
+
+(define-read-only (get-vault-info)
+  {
+    total-stx: (var-get total-stx-deposited),
+    total-btc-rewards: (var-get total-btc-rewards),
+    total-shares: (ft-get-supply yield-forge-token),
+    is-paused: (var-get contract-paused),
+    last-compound: (var-get last-compound-block),
+    current-cycle: (var-get current-cycle)
+  }
+)
+
+(define-read-only (get-user-info (user principal))
+  {
+    stx-deposited: (default-to u0 (map-get? user-deposits user)),
+    shares-owned: (ft-get-balance yield-forge-token user),
+    last-deposit-block: (default-to u0 (map-get? user-last-deposit-block user)),
+    withdrawable-stx: (calculate-withdrawable-amount user)
+  }
+)
+
+(define-read-only (calculate-withdrawable-amount (user principal))
+  (let (
+    (user-shares (ft-get-balance yield-forge-token user))
+    (total-supply (ft-get-supply yield-forge-token))
+    (total-stx (var-get total-stx-deposited))
+  )
+    (if (and (> user-shares u0) (> total-supply u0))
+      (/ (* user-shares total-stx) total-supply)
+      u0
+    )
+  )
+)
+
+(define-read-only (get-share-price)
+  (let (
+    (total-supply (ft-get-supply yield-forge-token))
+    (total-stx (var-get total-stx-deposited))
+  )
+    (if (> total-supply u0)
+      (/ (* total-stx u1000000) total-supply) ;; Price in micro-STX
+      u1000000 ;; 1:1 ratio initially
+    )
+  )
+)
+
+(define-read-only (get-stx-balance (user principal))
+  (stx-get-balance user)
+)
+
+(define-read-only (get-pending-btc-rewards)
+  ;; This would interface with PoX contract to get pending BTC rewards
+  ;; Simplified implementation
+  (let (
+    (cycles-since-last (- (get-current-cycle) (var-get current-cycle)))
+    (estimated-rewards (* cycles-since-last (var-get reward-rate)))
+  )
+    estimated-rewards
+  )
+)
+
+(define-read-only (get-current-cycle)
+  (/ block-height CYCLE_LENGTH)
+)

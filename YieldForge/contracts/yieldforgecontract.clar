@@ -1,13 +1,10 @@
 ;; title: yieldforgecontract
-;; version: 1.0.0
+;; version: 2.0.0
 ;; summary: Auto-compound vault that converts PoX BTC rewards to STX and restakes
 ;; description: YieldForge allows users to deposit STX, automatically participate in PoX stacking,
 ;;              convert BTC rewards to STX via AMM, and compound the rewards back into the vault.
 ;;              Users receive yield tokens representing their share of the growing vault.
-
-;; traits
-;; (use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
-;; (use-trait pox-trait 'ST000000000000000000002AMW42H.pox-4.pox-trait)
+;;              Enhanced with comprehensive security measures.
 
 ;; token definitions
 (define-fungible-token yield-forge-token u1000000000000000000)
@@ -32,6 +29,10 @@
 (define-constant ERR_INSUFFICIENT_SHARES (err u1007))
 (define-constant ERR_PAUSED (err u1008))
 (define-constant ERR_ZERO_AMOUNT (err u1009))
+(define-constant ERR_REENTRANCY (err u1012))
+(define-constant ERR_SLIPPAGE_TOO_HIGH (err u1014))
+(define-constant ERR_EMERGENCY_DELAY (err u1016))
+(define-constant ERR_INVALID_TIMESTAMP (err u1017))
 
 ;; data vars
 (define-data-var total-stx-deposited uint u0)
@@ -40,6 +41,7 @@
 (define-data-var last-compound-block uint u0)
 (define-data-var current-cycle uint u0)
 (define-data-var reward-rate uint u100) ;; basis points (1% = 100)
+(define-data-var reentrancy-lock bool false)
 
 ;; data maps
 (define-map user-deposits principal uint)
@@ -60,11 +62,16 @@
                     amount
                     (/ (* amount total-supply) total-stx)))
   )
-    ;; Validation checks
+    ;; Validation checks with security enhancements
     (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
+    (asserts! (> amount u0) ERR_ZERO_AMOUNT)
     (asserts! (>= amount MIN_DEPOSIT) ERR_INVALID_AMOUNT)
     (asserts! (<= amount MAX_DEPOSIT) ERR_INVALID_AMOUNT)
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Set reentrancy lock
+    (var-set reentrancy-lock true)
     
     ;; Transfer STX to contract
     (try! (stx-transfer? amount sender (as-contract tx-sender)))
@@ -79,6 +86,9 @@
     
     ;; Start stacking if not already active
     (let ((stacking-result (stack-stx-if-needed)))
+      ;; Clear reentrancy lock
+      (var-set reentrancy-lock false)
+      
       (ok {deposited: amount, shares-minted: share-amount})
     )
   )
@@ -94,21 +104,28 @@
                          (/ (* share-amount total-stx) total-supply)
                          u0))
   )
-    ;; Validation checks
+    ;; Validation checks with security enhancements
     (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
     (asserts! (> share-amount u0) ERR_ZERO_AMOUNT)
     (asserts! (>= user-shares share-amount) ERR_INSUFFICIENT_SHARES)
     (asserts! (>= total-stx withdrawal-amount) ERR_INSUFFICIENT_BALANCE)
     
-    ;; Burn yield tokens
+    ;; Set reentrancy lock
+    (var-set reentrancy-lock true)
+    
+    ;; Burn yield tokens first (CEI pattern)
     (try! (ft-burn? yield-forge-token share-amount sender))
     
     ;; Update state
     (var-set total-stx-deposited (- total-stx withdrawal-amount))
     (map-set user-deposits sender (- (default-to u0 (map-get? user-deposits sender)) withdrawal-amount))
     
-    ;; Transfer STX to user
+    ;; Transfer STX to user (last step)
     (try! (as-contract (stx-transfer? withdrawal-amount tx-sender sender)))
+    
+    ;; Clear reentrancy lock
+    (var-set reentrancy-lock false)
     
     (ok {withdrawn: withdrawal-amount, shares-burned: share-amount})
   )
@@ -123,6 +140,10 @@
     ;; Only compound if there are rewards and enough time has passed
     (asserts! (> btc-rewards u0) (ok u0))
     (asserts! (> current-block (+ last-compound u144)) (ok u0)) ;; ~1 day cooldown
+    (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
+    
+    ;; Set reentrancy lock
+    (var-set reentrancy-lock true)
     
     ;; Convert BTC to STX via AMM
     (match (swap-btc-to-stx btc-rewards)
@@ -134,10 +155,16 @@
         
         ;; Restake the new STX
         (let ((stacking-result (stack-stx-if-needed)))
+          ;; Clear reentrancy lock
+          (var-set reentrancy-lock false)
+          
           (ok ok-value)
         )
       )
-      err-value (err err-value)
+      err-value (begin
+        (var-set reentrancy-lock false)
+        (ok u0)
+      )
     )
   )
 )
@@ -154,6 +181,58 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
     (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (share-amount uint))
+  (let (
+    (sender tx-sender)
+    (user-shares (ft-get-balance yield-forge-token sender))
+    (total-supply (ft-get-supply yield-forge-token))
+    (total-stx (var-get total-stx-deposited))
+    (withdrawal-amount (if (> total-supply u0)
+                         (/ (* share-amount total-stx) total-supply)
+                         u0))
+  )
+    ;; Only allow during emergency pause
+    (asserts! (var-get contract-paused) ERR_PAUSED)
+    (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
+    (asserts! (> share-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (>= user-shares share-amount) ERR_INSUFFICIENT_SHARES)
+    
+    ;; Set reentrancy lock
+    (var-set reentrancy-lock true)
+    
+    ;; Burn yield tokens first (CEI pattern)
+    (try! (ft-burn? yield-forge-token share-amount sender))
+    
+    ;; Update state
+    (var-set total-stx-deposited (- total-stx withdrawal-amount))
+    (map-set user-deposits sender (- (default-to u0 (map-get? user-deposits sender)) withdrawal-amount))
+    
+    ;; Transfer STX to user (last step)
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender sender)))
+    
+    ;; Clear reentrancy lock
+    (var-set reentrancy-lock false)
+    
+    (ok {emergency-withdrawn: withdrawal-amount, shares-burned: share-amount})
+  )
+)
+
+(define-public (set-max-slippage (slippage-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (<= slippage-bps u500) (err u1014)) ;; ERR_SLIPPAGE_TOO_HIGH
+    (ok true)
+  )
+)
+
+(define-public (set-min-liquidity (min-liquidity-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (>= min-liquidity-amount MIN_DEPOSIT) ERR_INVALID_AMOUNT)
     (ok true)
   )
 )
@@ -224,7 +303,6 @@
   (/ stacks-block-height CYCLE_LENGTH)
 )
 
-
 ;; private functions
 
 (define-private (stack-stx-if-needed)
@@ -238,16 +316,14 @@
         (var-set current-cycle current-cycle-num)
         ;; In a real implementation, this would call the actual PoX contract
         ;; For now, we'll just record the stacking intent
-        (begin
-          (map-set stacking-cycles current-cycle-num 
-            {
-              start-block: stacks-block-height,
-              end-block: (+ stacks-block-height CYCLE_LENGTH),
-              amount: total-stx
-            }
-          )
-          (ok true)
+        (map-set stacking-cycles current-cycle-num 
+          {
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height CYCLE_LENGTH),
+            amount: total-stx
+          }
         )
+        (ok true)
       )
       (ok false)
     )

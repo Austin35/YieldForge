@@ -27,6 +27,10 @@
 (define-constant BOOST_MULTIPLIER_1 u1050000) ;; 1.05x boost (5%)
 (define-constant BOOST_MULTIPLIER_2 u1100000) ;; 1.10x boost (10%)
 (define-constant BOOST_MULTIPLIER_3 u1150000) ;; 1.15x boost (15%)
+(define-constant MAX_WITHDRAWAL_PER_TX u100000000000) ;; 100K STX max per withdrawal
+(define-constant DEPOSIT_COOLDOWN u6) ;; 6 blocks between deposits (~1 hour)
+(define-constant WITHDRAWAL_COOLDOWN u144) ;; 144 blocks between withdrawals (~1 day)
+(define-constant MAX_TOTAL_SUPPLY u10000000000000000) ;; Max 10B tokens
 
 ;; error constants
 (define-constant ERR_NOT_OWNER (err u1000))
@@ -45,6 +49,12 @@
 (define-constant ERR_INVALID_TIMESTAMP (err u1017))
 (define-constant ERR_BATCH_TOO_LARGE (err u1018))
 (define-constant ERR_INVALID_RECIPIENT (err u1019))
+(define-constant ERR_DEPOSIT_COOLDOWN (err u1020))
+(define-constant ERR_WITHDRAWAL_COOLDOWN (err u1021))
+(define-constant ERR_MAX_WITHDRAWAL_EXCEEDED (err u1022))
+(define-constant ERR_MAX_SUPPLY_EXCEEDED (err u1023))
+(define-constant ERR_INVALID_PRINCIPAL (err u1024))
+(define-constant ERR_SELF_TRANSFER (err u1025))
 
 ;; data vars
 (define-data-var total-stx-deposited uint u0)
@@ -58,6 +68,9 @@
 (define-data-var protocol-treasury principal tx-sender)
 (define-data-var last-apy-snapshot uint u0)
 (define-data-var cumulative-yield uint u0)
+(define-data-var max-slippage-bps uint u500) ;; 5% max slippage
+(define-data-var min-liquidity uint MIN_DEPOSIT)
+(define-data-var emergency-withdrawal-delay uint u1008) ;; ~7 days in blocks
 
 ;; data maps
 (define-map user-deposits principal uint)
@@ -68,6 +81,9 @@
 (define-map user-boost-tier principal uint) ;; 0=none, 1=5%, 2=10%, 3=15%
 (define-map apy-snapshots uint {apy: uint, timestamp: uint, total-value: uint})
 (define-map user-claimed-rewards principal uint)
+(define-map user-last-withdrawal-block principal uint)
+(define-map blacklisted-addresses principal bool)
+(define-map withdrawal-limits principal uint) ;; Custom limits per user
 
 ;; public functions
 
@@ -83,13 +99,19 @@
                     amount
                     (/ (* (* amount total-supply) PRECISION) (* total-stx PRECISION))))
   )
-    ;; Validation checks with security enhancements
+    ;; SECURITY: Validation checks with enhanced security
     (asserts! (not (var-get contract-paused)) ERR_PAUSED)
     (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
+    (asserts! (not (default-to false (map-get? blacklisted-addresses sender))) ERR_INVALID_PRINCIPAL)
+    (asserts! (not (is-eq sender (as-contract tx-sender))) ERR_SELF_TRANSFER)
     (asserts! (> amount u0) ERR_ZERO_AMOUNT)
     (asserts! (>= amount MIN_DEPOSIT) ERR_INVALID_AMOUNT)
     (asserts! (<= amount MAX_DEPOSIT) ERR_INVALID_AMOUNT)
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    ;; SECURITY: Check deposit cooldown
+    (asserts! (check-deposit-cooldown sender) ERR_DEPOSIT_COOLDOWN)
+    ;; SECURITY: Check max supply cap
+    (asserts! (<= (+ total-supply share-amount) MAX_TOTAL_SUPPLY) ERR_MAX_SUPPLY_EXCEEDED)
     
     ;; Set reentrancy lock
     (var-set reentrancy-lock true)
@@ -140,12 +162,17 @@
     (performance-fee (/ (* gains PERFORMANCE_FEE_BPS) u10000))
     (final-withdrawal (- net-withdrawal performance-fee))
   )
-    ;; Validation checks with security enhancements
+    ;; SECURITY: Validation checks with enhanced security
     (asserts! (not (var-get contract-paused)) ERR_PAUSED)
     (asserts! (not (var-get reentrancy-lock)) ERR_REENTRANCY)
+    (asserts! (not (default-to false (map-get? blacklisted-addresses sender))) ERR_INVALID_PRINCIPAL)
     (asserts! (> share-amount u0) ERR_ZERO_AMOUNT)
     (asserts! (>= user-shares share-amount) ERR_INSUFFICIENT_SHARES)
     (asserts! (>= total-stx gross-withdrawal) ERR_INSUFFICIENT_BALANCE)
+    ;; SECURITY: Check withdrawal cooldown
+    (asserts! (check-withdrawal-cooldown sender) ERR_WITHDRAWAL_COOLDOWN)
+    ;; SECURITY: Check max withdrawal limit
+    (asserts! (<= final-withdrawal (get-user-withdrawal-limit sender)) ERR_MAX_WITHDRAWAL_EXCEEDED)
     
     ;; Set reentrancy lock
     (var-set reentrancy-lock true)
@@ -168,6 +195,9 @@
     
     ;; Transfer STX to user (last step)
     (try! (as-contract (stx-transfer? final-withdrawal tx-sender sender)))
+    
+    ;; SECURITY: Update last withdrawal block
+    (map-set user-last-withdrawal-block sender stacks-block-height)
     
     ;; Clear reentrancy lock
     (var-set reentrancy-lock false)
@@ -319,6 +349,46 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
     (asserts! (not (is-eq new-treasury tx-sender)) ERR_INVALID_RECIPIENT)
     (var-set protocol-treasury new-treasury)
+    (ok true)
+  )
+)
+
+;; SECURITY: Admin function to blacklist malicious addresses
+(define-public (blacklist-address (address principal) (blacklisted bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (not (is-eq address CONTRACT_OWNER)) ERR_INVALID_PRINCIPAL)
+    (map-set blacklisted-addresses address blacklisted)
+    (ok true)
+  )
+)
+
+;; SECURITY: Admin function to set custom withdrawal limits
+(define-public (set-withdrawal-limit (user principal) (limit uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (<= limit MAX_WITHDRAWAL_PER_TX) ERR_INVALID_AMOUNT)
+    (map-set withdrawal-limits user limit)
+    (ok true)
+  )
+)
+
+;; SECURITY: Admin function to update max slippage
+(define-public (update-max-slippage (new-slippage-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (<= new-slippage-bps u1000) ERR_SLIPPAGE_TOO_HIGH) ;; Max 10%
+    (var-set max-slippage-bps new-slippage-bps)
+    (ok true)
+  )
+)
+
+;; SECURITY: Admin function to update emergency withdrawal delay
+(define-public (update-emergency-delay (new-delay uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (>= new-delay u144) ERR_INVALID_AMOUNT) ;; Min 1 day
+    (var-set emergency-withdrawal-delay new-delay)
     (ok true)
   )
 )
@@ -645,6 +715,31 @@
       error-val {success: (get success acc), failed: (+ (get failed acc) u1)}
     )
   )
+)
+
+;; SECURITY: Helper function to check deposit cooldown
+(define-private (check-deposit-cooldown (user principal))
+  (let (
+    (last-deposit (default-to u0 (map-get? user-last-deposit-block user)))
+    (blocks-since-deposit (- stacks-block-height last-deposit))
+  )
+    (or (is-eq last-deposit u0) (>= blocks-since-deposit DEPOSIT_COOLDOWN))
+  )
+)
+
+;; SECURITY: Helper function to check withdrawal cooldown
+(define-private (check-withdrawal-cooldown (user principal))
+  (let (
+    (last-withdrawal (default-to u0 (map-get? user-last-withdrawal-block user)))
+    (blocks-since-withdrawal (- stacks-block-height last-withdrawal))
+  )
+    (or (is-eq last-withdrawal u0) (>= blocks-since-withdrawal WITHDRAWAL_COOLDOWN))
+  )
+)
+
+;; SECURITY: Get user's withdrawal limit (custom or default)
+(define-private (get-user-withdrawal-limit (user principal))
+  (default-to MAX_WITHDRAWAL_PER_TX (map-get? withdrawal-limits user))
 )
 
 ;; Helper function for minimum value
